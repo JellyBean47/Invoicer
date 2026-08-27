@@ -1,0 +1,247 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function userDoc() {
+      return get(/databases/$(database)/documents/users/$(request.auth.uid)).data;
+    }
+
+    function userBusinessId() {
+      return userDoc().businessId;
+    }
+
+    function belongsToUserBusiness() {
+      return isSignedIn()
+        && resource.data.businessId == userBusinessId();
+    }
+
+    function willBelongToUserBusiness() {
+      return isSignedIn()
+        && request.resource.data.businessId == userBusinessId();
+    }
+
+    match /users/{userId} {
+      allow read, update: if isSignedIn() && request.auth.uid == userId;
+      allow create: if isSignedIn() && request.auth.uid == userId;
+      allow delete: if false;
+    }
+
+    match /businesses/{businessId} {
+      allow read: if isSignedIn() && userBusinessId() == businessId;
+      // Allow first-time setup when the user has no business yet.
+      allow create: if isSignedIn()
+        && request.resource.data.businessId == businessId
+        && (userBusinessId() == '' || userBusinessId() == businessId);
+      allow update: if isSignedIn() && userBusinessId() == businessId;
+      allow delete: if false;
+    }
+
+    match /settings/{businessId} {
+      allow read, update: if isSignedIn() && userBusinessId() == businessId;
+      allow create: if isSignedIn()
+        && request.resource.data.businessId == businessId
+        && userBusinessId() == businessId;
+      allow delete: if false;
+    }
+
+    match /customers/{customerId} {
+      allow read: if isSignedIn() && belongsToUserBusiness();
+      allow create: if isSignedIn()
+        && willBelongToUserBusiness()
+        && request.resource.data.customerId == customerId
+        && request.resource.data.name is string
+        && request.resource.data.phone is string
+        && request.resource.data.status in ['active', 'archived'];
+      allow update: if isSignedIn()
+        && belongsToUserBusiness()
+        && willBelongToUserBusiness();
+      allow delete: if false;
+    }
+
+    match /jobs/{jobId} {
+      allow read: if isSignedIn() && belongsToUserBusiness();
+      allow create: if isSignedIn()
+        && willBelongToUserBusiness()
+        && request.resource.data.jobId == jobId
+        && request.resource.data.customerId is string
+        && request.resource.data.title is string
+        && request.resource.data.status in [
+          'draft', 'scheduled', 'in_progress', 'completed', 'cancelled'
+        ];
+      allow update: if isSignedIn()
+        && belongsToUserBusiness()
+        && willBelongToUserBusiness()
+        // Completed jobs cannot return to draft.
+        && !(resource.data.status == 'completed'
+          && request.resource.data.status == 'draft');
+      allow delete: if false;
+    }
+
+    match /quotes/{quoteId} {
+      allow read: if isSignedIn() && belongsToUserBusiness();
+      allow create: if isSignedIn()
+        && willBelongToUserBusiness()
+        && request.resource.data.quoteId == quoteId
+        && request.resource.data.customerId is string
+        && request.resource.data.status in [
+          'draft', 'sent', 'accepted', 'rejected', 'expired'
+        ];
+      allow update: if isSignedIn()
+        && belongsToUserBusiness()
+        && willBelongToUserBusiness();
+      allow delete: if false;
+
+      match /items/{itemId} {
+        function parentQuote() {
+          return get(/databases/$(database)/documents/quotes/$(quoteId)).data;
+        }
+        allow read, write: if isSignedIn()
+          && parentQuote().businessId == userBusinessId();
+      }
+    }
+
+    match /invoices/{invoiceId} {
+      allow read: if isSignedIn() && belongsToUserBusiness();
+      allow create: if isSignedIn()
+        && willBelongToUserBusiness()
+        && request.resource.data.invoiceId == invoiceId
+        && request.resource.data.customerId is string
+        && request.resource.data.invoiceNumber is string
+        && request.resource.data.status == 'draft';
+      // Draft: full edit / cancel. Finalized: only payment fields (Phase 6).
+      allow update: if isSignedIn()
+        && belongsToUserBusiness()
+        && willBelongToUserBusiness()
+        && (
+          resource.data.status == 'draft'
+          || (
+            resource.data.status in ['final', 'partial', 'overdue', 'paid']
+            && request.resource.data.invoiceNumber == resource.data.invoiceNumber
+            && request.resource.data.customerId == resource.data.customerId
+            && request.resource.data.subtotal == resource.data.subtotal
+            && request.resource.data.discount == resource.data.discount
+            && request.resource.data.taxPercent == resource.data.taxPercent
+            && request.resource.data.taxAmount == resource.data.taxAmount
+            && request.resource.data.grandTotal == resource.data.grandTotal
+            && request.resource.data.issueDate == resource.data.issueDate
+            && request.resource.data.status in [
+              'final', 'partial', 'overdue', 'paid'
+            ]
+          )
+        );
+      allow delete: if false;
+
+      match /items/{itemId} {
+        function parentInvoice() {
+          return get(/databases/$(database)/documents/invoices/$(invoiceId)).data;
+        }
+        function parentExists() {
+          return exists(/databases/$(database)/documents/invoices/$(invoiceId));
+        }
+        allow read: if isSignedIn()
+          && parentExists()
+          && parentInvoice().businessId == userBusinessId();
+        // Create/update only while parent draft exists and belongs to this business.
+        allow create, update: if isSignedIn()
+          && parentExists()
+          && parentInvoice().businessId == userBusinessId()
+          && parentInvoice().status == 'draft'
+          && request.resource.data.description is string
+          && request.resource.data.quantity is int
+          && request.resource.data.unitPrice is int
+          && request.resource.data.lineTotal is int;
+        allow delete: if isSignedIn()
+          && parentExists()
+          && parentInvoice().businessId == userBusinessId()
+          && parentInvoice().status == 'draft';
+      }
+    }
+
+    match /payments/{paymentId} {
+      allow read: if isSignedIn() && belongsToUserBusiness();
+      allow create: if isSignedIn()
+        && willBelongToUserBusiness()
+        && request.resource.data.paymentId == paymentId
+        && request.resource.data.invoiceId is string
+        && request.resource.data.customerId is string
+        && request.resource.data.amount is int
+        && request.resource.data.amount > 0
+        && request.resource.data.paymentMethod in [
+          'cash', 'eft', 'card', 'other'
+        ];
+      // Payments are immutable financial records.
+      allow update, delete: if false;
+    }
+
+    match /expenses/{expenseId} {
+      allow read: if isSignedIn() && belongsToUserBusiness();
+      allow create: if isSignedIn()
+        && willBelongToUserBusiness()
+        && request.resource.data.expenseId == expenseId
+        && request.resource.data.description is string
+        && request.resource.data.amount is int
+        && request.resource.data.amount > 0
+        && request.resource.data.category in [
+          'fuel', 'materials', 'equipment', 'office_supplies', 'rent', 'other'
+        ]
+        && request.resource.data.status in ['active', 'archived'];
+      allow update: if isSignedIn()
+        && belongsToUserBusiness()
+        && willBelongToUserBusiness()
+        && request.resource.data.amount is int
+        && request.resource.data.amount > 0;
+      allow delete: if false;
+    }
+
+    match /activity_logs/{logId} {
+      allow read: if isSignedIn() && belongsToUserBusiness();
+      allow create: if isSignedIn()
+        && willBelongToUserBusiness()
+        && request.resource.data.logId == logId
+        && request.resource.data.userId == request.auth.uid;
+      // Only manual notes may be edited (enforced further in app services).
+      allow update: if isSignedIn()
+        && belongsToUserBusiness()
+        && resource.data.isManualNote == true
+        && request.resource.data.isManualNote == true
+        && request.resource.data.action == 'note';
+      allow delete: if false;
+    }
+
+    match /notifications/{notificationId} {
+      allow read: if isSignedIn() && belongsToUserBusiness();
+      allow create: if isSignedIn()
+        && willBelongToUserBusiness()
+        && request.resource.data.notificationId == notificationId;
+      allow update: if isSignedIn() && belongsToUserBusiness();
+      allow delete: if isSignedIn() && belongsToUserBusiness();
+    }
+
+    match /sync_queue/{operationId} {
+      allow read: if isSignedIn() && belongsToUserBusiness();
+      allow create: if isSignedIn()
+        && willBelongToUserBusiness()
+        && request.resource.data.operationId == operationId;
+      allow update: if isSignedIn() && belongsToUserBusiness();
+      allow delete: if isSignedIn() && belongsToUserBusiness();
+    }
+
+    // Remaining collections — tighten as features land.
+    // Financial collections excluded so dedicated rules are not bypassed.
+    match /{collection}/{docId} {
+      allow read: if isSignedIn()
+        && belongsToUserBusiness()
+        && !(collection in ['invoices', 'payments', 'expenses', 'notifications', 'sync_queue']);
+      allow create: if isSignedIn()
+        && willBelongToUserBusiness()
+        && !(collection in ['invoices', 'payments', 'expenses', 'notifications', 'sync_queue']);
+      allow update: if isSignedIn()
+        && belongsToUserBusiness()
+        && !(collection in ['invoices', 'payments', 'expenses', 'notifications', 'sync_queue']);
+      allow delete: if false;
+    }
+  }
+}
